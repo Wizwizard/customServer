@@ -2,20 +2,26 @@
 #include "sqStack.h"
 #include <pthread.h>
 
+void init();
 void doit(int sockfd);
 void inter2client(int);
 void checkHeart(int);
 int isOperator(char);
 int calcu(int, int, char);
+void printPcontent(char *pcontent, int length);
+void calPrefixExpression(char *expression, int recvLength, char *result);
 int BtoI(char *);
 void ItoB(int, char*);
 
 int lifetime = 10;
 
+const int heartLength = 6;
+char heartPackage[6];
+char messageWrapper[6];
+
 int main(int argc, char *argv[])
 {
 	int listenfd, connfd;
-	pid_t childpid;
 	socklen_t clilen;
 	struct sockaddr_in cliaddr, servaddr;
 	
@@ -30,20 +36,42 @@ int main(int argc, char *argv[])
 	
 	Listen(listenfd, LISTENQ);
 
+	init();
+
 	for( ; ; )
 	{
 		clilen = sizeof(cliaddr);
+		printf("waiting..\n");
 		connfd = Accept(listenfd, (SA *) &cliaddr, &clilen);
-		
-		if ( (childpid = Fork()) == 0)
-		{
-			Close(listenfd);
-			doit(connfd);
-			exit(0);
-		}
-		Close(connfd);
+		printf("connect...\n");
+		doit(connfd);
 	}
+	printf("jump of for?");
 }
+
+void init()
+{
+	char heartPcontentLength[4],msgPcontentLength[4];
+	int heartPlength = 1, msgPlength = 4;
+	
+	memset(heartPackage, 0, heartLength);
+	memset(messageWrapper, 0, 6);
+	
+	ItoB(heartPlength, heartPcontentLength);
+	ItoB(msgPlength, msgPcontentLength);
+
+	heartPackage[0] = 'p';
+	messageWrapper[0] = 'p';
+	heartPackage[5] = 'h';
+	messageWrapper[5] = 'm';
+
+	memcpy(&heartPackage[1], heartPcontentLength, 4);
+	memcpy(&messageWrapper[1], msgPcontentLength, 4);
+	
+	//printPcontent(heartPackage, 6);
+	//printPcontent(messageWrapper, 6);
+}
+
 void doit(int sockfd)
 {
 	pthread_t idInter, idHeart;
@@ -57,14 +85,113 @@ void doit(int sockfd)
 	if (ret != 0)
 		unix_error("create heart");
 
-	pthread_join(idInter, NULL);
 }
+
 void inter2client(int sockfd)
 {
-	printf("enter in inter\n");
-	char readline[MAXLINE];
-	int recvLength;
+	char phead;
+	char ptype;
+	char pcontent[MAXLINE];
+	int plength;
+	char lengthByte[4];
+	char result[4];
+	char replyline[MAXLINE];
+	int rc;
+
+	char discardPackage[18];
 	
+	memcpy(replyline, messageWrapper, 6);
+
+	while( (readn(sockfd, &phead, 1)) > 0)
+	{
+		memset(&replyline[6], 0, MAXLINE - 6);
+		
+		if(phead == 'G')
+		{
+			readn(sockfd, discardPackage, 17);
+			continue;
+		}
+		if(phead != 'p')
+		{
+			printf("wrong package!\n");
+			break;
+		}
+
+		rc = readn(sockfd, lengthByte, 4);
+		if (rc != 4)
+		{
+			printf("wrong lengthByte!\n");
+			break;
+		}
+		plength = BtoI(lengthByte);
+		
+		rc = readn(sockfd, &ptype, 1);
+		if (rc != 1)
+		{
+			printf("wrong ptype!\n");
+			break;
+		}
+		if (ptype == 'h')
+		{
+			lifetime = 5;
+			//设置与心跳线程的共享变量
+		} else if (ptype == 'm')
+		{
+			rc = readn(sockfd, pcontent, plength);
+			if( rc != plength)
+			{
+				printf("package loss content!\n");
+				break;
+			}
+			printPcontent(pcontent, plength);
+			calPrefixExpression(pcontent, plength, result);
+			memcpy(&replyline[6], result, 4);
+			printPcontent(replyline, 10);
+			if( writen(sockfd, replyline, 10) < 0)
+			{
+				printf("client is close!");
+				break;
+			}
+		} else
+		{
+			printf("wrong package!\n");
+			break;
+		}
+	}	
+	printf("client is close--inter\n");
+	
+	//shutdown(sockfd, 2);
+}
+
+void checkHeart(int sockfd)
+{
+	while(lifetime > 0)
+	{
+		sleep(1);
+		printf("lifetime = %d\n", lifetime);
+		if (writen(sockfd, heartPackage, heartLength) < 0)
+		{
+			printf("client is close --heart\n");
+			break;
+		}
+		lifetime --;
+	}
+	printf("shutdown client\n");
+	//shutdown(sockfd, 2);
+}
+
+void printPcontent(char *pcontent, int length)
+{
+	int i ;
+	for (i = 0; i < length; i++)
+	{
+		printf("%d ",pcontent[i]);
+	}
+	printf("\n");
+}
+
+void calPrefixExpression(char *expression, int recvLength, char *resultByte)
+{	
 	int i;
 	char numstr[4];
 	int num;
@@ -75,38 +202,26 @@ void inter2client(int sockfd)
 	
 	initStack(&s);
 
-	while(1)
-	{
-	clearStack(&s);
-
-	recvLength = read(sockfd , readline, MAXLINE);
-	lifetime = 10;
-	if(recvLength <= 0)
-	{
-		printf("client is close!\n");
-		exit(0);
-	}
-	
-	printf("recvlength = %d\n", recvLength);
-	for(i = 0; i < recvLength; i ++)
-		printf("%d ", readline[i]);
+	clearStack(&s);	
+	for(i = 0; i < recvLength; i ++)	
+		printf("%d ", expression[i]);
 	printf("\n");
 
 	for(i = recvLength - 1; i >= 0;)
 	{
-		if(isOperator(readline[i]))
+		if(isOperator(expression[i]))
 		{
 			pop(&s, &leftNum);
 			pop(&s, &rightNum);
-			result = calcu(leftNum, rightNum, readline[i]);
-			printf("%d %c %d\n", leftNum, readline[i], rightNum);
+			result = calcu(leftNum, rightNum, expression[i]);
+			printf("%d %c %d\n", leftNum, expression[i], rightNum);
 			push(&s, result);
 			i--;	
 		}
 		else
 		{
 			i -= 3;
-			memcpy(numstr, &readline[i], 4);
+			memcpy(numstr, &expression[i], 4);
 			num = (BtoI(numstr));
 			printf("%d\n", num);
 			push(&s, num);	
@@ -116,21 +231,7 @@ void inter2client(int sockfd)
 	pop(&s, &result);
 	ItoB(result, numstr);
 	printf("结果为: %d\n", result);
-	Writen(sockfd, numstr, 4);
-	}
-}
-
-void checkHeart(int sockfd)
-{
-	printf("enter in heart\n");
-	while(lifetime > 0)
-	{
-		sleep(1);
-		printf("lifetime = %d\n", lifetime);
-		lifetime --;
-	}
-	printf("shutdown\n");
-	shutdown(sockfd, 2);
+	memcpy(resultByte, numstr, 4);
 }
 
 int isOperator(char c)

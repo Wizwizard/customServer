@@ -1,8 +1,8 @@
 customServer: customServer.o unp.o sqStack.o
-	gcc -o customServer -ggdb -lpthread customServer.o unp.o sqStack.o
+	gcc -o customServer -lpthread customServer.o unp.o sqStack.o
 
 customServer.o: customServer.c
-	gcc -c -ggdb -lpthread customServer.c
+	gcc -c -lpthread customServer.c
 unp.o: unp.c
 	gcc -c -ggdb unp.c
 sqStack.o: sqStack.c
