@@ -1,6 +1,8 @@
 #include "unp.h"
 #include "sqStack.h"
 #include <pthread.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
 
 void init();
 void doit(int sockfd);
@@ -12,10 +14,13 @@ void printPcontent(char *pcontent, int length);
 void calPrefixExpression(char *expression, int recvLength, char *result);
 int BtoI(char *);
 void ItoB(int, char*);
+int make_socket_non_blocking(int sfd);
 
 int lifetime = 10;
 
-const int heartLength = 6;
+#define heartLength 6
+#define MAXEVENTS 64
+
 char heartPackage[6];
 char messageWrapper[6];
 
@@ -23,6 +28,10 @@ int main(int argc, char *argv[])
 {
 	int listenfd, connfd;
 	socklen_t clilen;
+	int efd;
+	struct epoll_event event;
+	struct epoll_event *events;
+	
 	struct sockaddr_in cliaddr, servaddr;
 	
 	listenfd = Socket(AF_INET, SOCK_STREAM, 0);
@@ -35,18 +44,78 @@ int main(int argc, char *argv[])
 	Bind(listenfd, (SA *) &servaddr, sizeof(servaddr));
 	
 	Listen(listenfd, LISTENQ);
+	
+	make_socket_non_blocking(listenfd);
 
+	efd = epoll_create(10);
+	if(efd == -1)
+	{
+		unix_error("epoll_create");
+	}
+	event.data.fd = listenfd;
+	event.events = EPOLLIN | EPOLLET;
+	if (epoll_ctl(efd, EPOLL_CTL_ADD, listenfd, &event) == -1)
+	{
+		unix_error("epoll_ctl");
+	}
+	
+	events = calloc(MAXEVENTS, sizeof (event));
+	
 	init();
 
 	for( ; ; )
 	{
-		clilen = sizeof(cliaddr);
-		printf("waiting..\n");
-		connfd = Accept(listenfd, (SA *) &cliaddr, &clilen);
-		printf("connect...\n");
-		doit(connfd);
+		int n, i;
+		
+		n = epoll_wait(efd, events, MAXEVENTS, -1);
+		for (i = 0; i < n; i++)
+		{
+			if ((events[i].events & EPOLLERR) ||
+				(events[i].events & EPOLLHUP) ||
+				(!(events[i].events & EPOLLIN)))
+			{
+				fprintf(stderr, "epoll error: socket close\n");
+				Close(events[i].data.fd);
+				continue;
+			}
+
+			else if (listenfd == events[i].data.fd)
+			{
+				while (1)
+				{
+					clilen = sizeof(cliaddr);
+					printf("waiting..\n");
+					connfd = accept(listenfd, (SA *) &cliaddr, &clilen);
+					if (connfd == -1)
+					{
+						if ((errno == EAGAIN) ||
+							(errno == EWOULDBLOCK))
+						{
+							break;
+						}
+						else
+						{
+							unix_error("accept");
+						}
+					}
+					printf("connect...\n");
+					make_socket_non_blocking(connfd);
+
+					event.data.fd = connfd;
+					event.events = EPOLLIN | EPOLLET;
+					if ((epoll_ctl(efd, EPOLL_CTL_ADD, connfd, &event)) == -1)
+						unix_error("epoll_ctl");					
+					doit(connfd);
+				}
+				printf("jump of for?");
+				continue;
+			}
+			else 
+			{
+				doit(events[i].data.fd);
+			}
+		}
 	}
-	printf("jump of for?");
 }
 
 void init()
@@ -72,6 +141,7 @@ void init()
 	//printPcontent(messageWrapper, 6);
 }
 
+/**
 void doit(int sockfd)
 {
 	pthread_t idInter, idHeart;
@@ -85,6 +155,12 @@ void doit(int sockfd)
 	if (ret != 0)
 		unix_error("create heart");
 
+}
+**/
+
+void doit(int sockfd)
+{
+	inter2client(sockfd);
 }
 
 void inter2client(int sockfd)
@@ -102,26 +178,26 @@ void inter2client(int sockfd)
 	
 	memcpy(replyline, messageWrapper, 6);
 
-	while( (readn(sockfd, &phead, 1)) > 0)
+	while (readn(sockfd, &phead, 1) > 0)
 	{
 		memset(&replyline[6], 0, MAXLINE - 6);
 		
 		if(phead == 'G')
 		{
 			readn(sockfd, discardPackage, 17);
-			continue;
+			return ;
 		}
 		if(phead != 'p')
 		{
 			printf("wrong package!\n");
-			break;
+			return ;
 		}
 
 		rc = readn(sockfd, lengthByte, 4);
 		if (rc != 4)
 		{
 			printf("wrong lengthByte!\n");
-			break;
+			return ;
 		}
 		plength = BtoI(lengthByte);
 		
@@ -129,7 +205,7 @@ void inter2client(int sockfd)
 		if (rc != 1)
 		{
 			printf("wrong ptype!\n");
-			break;
+			return ;
 		}
 		if (ptype == 'h')
 		{
@@ -141,7 +217,7 @@ void inter2client(int sockfd)
 			if( rc != plength)
 			{
 				printf("package loss content!\n");
-				break;
+				return ;
 			}
 			printPcontent(pcontent, plength);
 			calPrefixExpression(pcontent, plength, result);
@@ -150,16 +226,16 @@ void inter2client(int sockfd)
 			if( writen(sockfd, replyline, 10) < 0)
 			{
 				printf("client is close!");
-				break;
+				return ;
 			}
 		} else
 		{
 			printf("wrong package!\n");
-			break;
+			return ;
 		}
 	}	
 	printf("client is close--inter\n");
-	
+	return ;
 	//shutdown(sockfd, 2);
 }
 
@@ -258,6 +334,26 @@ int calcu(int leftNum, int rightNum, char c)
 		return leftNum * rightNum;
 	else if (c == '/')
 		return leftNum / rightNum;
+	return 0;
+}
+
+int make_socket_non_blocking(int sfd)
+{
+	int flags, s;
+	
+	flags = fcntl(sfd, F_GETFL, 0);
+	if(flags == -1)
+	{
+		unix_error("fcntl get");
+	}
+	
+	flags |= O_NONBLOCK;
+	s = fcntl(sfd, F_SETFL, flags);
+	if (s == -1)
+	{
+		unix_error("fcntl set");
+	}
+		
 	return 0;
 }
 
